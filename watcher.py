@@ -1,11 +1,12 @@
-# Minimal Mercari -> Discord watcher (with robust fallbacks)
+# Minimal Mercari -> Discord watcher (robust + debug)
 # Requirements:
 #   pip install playwright requests python-dotenv
 #   python -m playwright install chromium
 #
 # Env:
-#   DISCORD_WEBHOOK (required) - Discord channel webhook URL
-#   MAX_PRICE       (optional) - max price to include (default 9999)
+#   DISCORD_WEBHOOK (required)
+#   MAX_PRICE       (optional, default 9999)
+#   DEBUG           (optional: "1"/"true" to save search.png and print extra info)
 
 import asyncio, os, re
 from urllib.parse import urlencode
@@ -16,6 +17,7 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 load_dotenv()
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
 MAX_PRICE = int(os.getenv("MAX_PRICE", "9999"))
+DEBUG = os.getenv("DEBUG", "").lower() in ("1","true","yes","on")
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -23,14 +25,14 @@ UA = (
     "Chrome/124.0 Safari/537.36"
 )
 
-SEARCH_PARAMS = {"keyword": "boygenius baggu", "status": "on_sale", "sort": "created_time"}
+# Keep search basic; some params (like status) can hide results in some regions
+SEARCH_PARAMS = {"keyword": "boygenius baggu", "sort": "created_time"}
 
 def build_search_url():
     return f"https://www.mercari.com/search/?{urlencode(SEARCH_PARAMS)}"
 
 def parse_price(text: str):
-    if not text:
-        return None
+    if not text: return None
     m = re.search(r"\$([\d,]+)", text)
     return int(m.group(1).replace(",", "")) if m else None
 
@@ -42,129 +44,119 @@ def send_discord(content: str):
     except Exception as e:
         print("[Discord] error:", e)
 
-async def scrape_cards(page):
-    """Primary strategy: read listing cards rendered on the search page."""
-    # Common test IDs/selectors Mercari uses; we’ll try several.
-    card_selectors = [
-        "[data-testid='ItemCell']",
-        "[data-test='item-cell']",
-        "li a[href*='/item/']",
-        "a[href*='/item/']",
-    ]
-
-    seen = set()
-    results = []
-
-    for sel in card_selectors:
-        cards = await page.locator(sel).all()
-        for el in cards:
-            # Find the anchor with the item URL
-            a = el if await el.evaluate("el => el.tagName.toLowerCase()==='a'") else el.locator("a[href*='/item/']").first
-            if await a.count() == 0:
-                continue
-            href = await a.get_attribute("href")
-            if not href:
-                continue
-            url = f"https://www.mercari.com{href}" if href.startswith("/") else href
-            if "/item/" not in url or url in seen:
-                continue
-            seen.add(url)
-
-            # Title (best-effort from the card)
-            try:
-                title = (await a.text_content()) or ""
-            except:
-                title = ""
-
-            # Price within the card
-            price_el = a.locator("text=/\\$\\d[\\d,]*/").first
-            price_txt = await price_el.text_content() if await price_el.count() else ""
-            price = parse_price(price_txt)
-            if price is None:
-                # try within the card container
-                price_el2 = el.locator("text=/\\$\\d[\\d,]*/").first
-                price_txt = await price_el2.text_content() if await price_el2.count() else ""
-                price = parse_price(price_txt)
-
-            if price is None:
-                continue
-
-            results.append({"title": " ".join(title.split()), "price": price, "url": url})
-
-    return results
-
-async def scrape_from_html_then_visit(ctx, html, limit=8):
-    """
-    Fallback: regex item URLs from the page HTML, then visit a few item pages
-    to read title + price directly.
-    """
-    urls = []
-    for m in re.finditer(r'href="(/(?:us/)?item/[^"]+)"', html):
-        u = m.group(1)
-        if u not in urls:
-            urls.append(u)
-    full_urls = [f"https://www.mercari.com{u}" if u.startswith("/") else u for u in urls]
-    results = []
-    for url in full_urls[:limit]:
-        page = await ctx.new_page()
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=90000)
-            # title: page H1 or document title as fallback
-            title = ""
-            try:
-                title = await page.locator("h1, [data-testid='item-title']").first.text_content()
-            except:
-                pass
-            if not title:
-                try:
-                    title = await page.title()
-                except:
-                    title = url
-
-            # price: look for $### anywhere visible near buy box
-            price_txt = ""
-            try:
-                price_txt = await page.locator("text=/\\$\\d[\\d,]*/").first.text_content()
-            except:
-                pass
-            price = parse_price(price_txt)
-            if price is None:
-                continue
-
-            results.append({"title": " ".join((title or "").split()), "price": price, "url": url})
-        finally:
-            await page.close()
-    return results
-
 async def fetch_listings():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
         )
         ctx = await browser.new_context(
             user_agent=UA,
             locale="en-US",
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            ignore_https_errors=True,
+            viewport={"width": 1280, "height": 1800},
         )
+        await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         page = await ctx.new_page()
 
-        # Load search (don’t wait for networkidle; CI pages often never settle)
-        await page.goto(build_search_url(), wait_until="domcontentloaded", timeout=90000)
+        url = build_search_url()
+        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
 
-        # Nudge lazy loaders
+        # Let the client render & lazy-load a bit
         for _ in range(3):
-            await page.wait_for_timeout(800)
+            await page.wait_for_timeout(900)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
 
-        # Strategy 1: cards
-        results = await scrape_cards(page)
+        # Prefer specific cards if present; fall back to any anchor with /item/
+        selectors = [
+            "[data-testid='ItemCell'] a[href*='/item/']",
+            "[data-test='item-cell'] a[href*='/item/']",
+            "li a[href*='/item/']",
+            "a[href*='/item/']",
+            # XPath fallback
+            "//a[contains(@href,'/item/')]",
+        ]
 
-        # Strategy 2: regex item URLs from HTML, then visit a few
-        if not results:
-            html = await page.content()
-            fallback = await scrape_from_html_then_visit(ctx, html, limit=8)
-            results.extend(fallback)
+        results = []
+        seen = set()
+
+        for sel in selectors:
+            loc = page.locator(sel) if not sel.startswith("//") else page.locator(f"{sel}")
+            try:
+                count = await loc.count()
+            except Exception:
+                count = 0
+
+            if DEBUG:
+                print(f"[DEBUG] Selector {sel!r} count: {count}")
+
+            if count == 0:
+                continue
+
+            elements = await loc.all()
+            for el in elements:
+                try:
+                    href = await el.get_attribute("href")
+                except Exception:
+                    href = None
+                if not href:
+                    continue
+
+                url = f"https://www.mercari.com{href}" if href.startswith("/") else href
+                if "/item/" not in url or url in seen:
+                    continue
+                seen.add(url)
+
+                # Title + price (best-effort from the card)
+                try:
+                    title = (await el.text_content()) or ""
+                except Exception:
+                    title = ""
+
+                price_el = el.locator("text=/\\$\\d[\\d,]*/").first
+                try:
+                    has_price = await price_el.count()
+                except Exception:
+                    has_price = 0
+                price_txt = await price_el.text_content() if has_price else ""
+                price = parse_price(price_txt)
+
+                # If price not on the anchor, try within the parent card
+                if price is None:
+                    parent = el.locator("xpath=ancestor::*[self::li or self::div][1]")
+                    price_el2 = parent.locator("text=/\\$\\d[\\d,]*/").first
+                    try:
+                        has_p2 = await price_el2.count()
+                    except Exception:
+                        has_p2 = 0
+                    price_txt = await price_el2.text_content() if has_p2 else ""
+                    price = parse_price(price_txt)
+
+                if price is None:
+                    continue
+
+                results.append({
+                    "title": " ".join((title or "").split()),
+                    "price": price,
+                    "url": url
+                })
+
+            if results:
+                break  # we found items with this selector, no need to try the rest
+
+        if DEBUG:
+            try:
+                await page.screenshot(path="search.png", full_page=True)
+                print("[DEBUG] Saved screenshot: search.png")
+                print(f"[DEBUG] Found {len(results)} card(s) before price filter.")
+            except Exception as e:
+                print("[DEBUG] Screenshot failed:", e)
 
         await browser.close()
         return results
