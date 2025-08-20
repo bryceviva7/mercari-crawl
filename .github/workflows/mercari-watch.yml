@@ -18,4 +18,4 @@ jobs:
       - run: python watcher.py
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          ALERT_THRESHOLD: "100"
+          ALERT_THRESHOLD: "200"
