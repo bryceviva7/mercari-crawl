@@ -19,22 +19,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install playwright requests python-dotenv
 
-      # 👇 Let Playwright install the right OS packages for the runner (handles libasound2t64, etc.)
+      # Let Playwright install the correct OS packages for this runner image
       - name: Install Playwright system deps
         run: python -m playwright install-deps
 
-      - name: Install Playwright browser (WebKit)
-        run: python -m playwright install webkit
+      # Install both WebKit (preferred) and Chromium (fallback)
+      - name: Install Playwright browsers
+        run: |
+          python -m playwright install webkit
+          python -m playwright install chromium
 
       - name: Run watcher
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          MAX_PRICE: "200"              # <- set your ceiling
-          PLAYWRIGHT_ENGINE: "webkit"   # <- keep webkit for reliability on hosted runners
-          DEBUG: "0"                    # set to "1" for one run if you need debug artifacts
+          MAX_PRICE: "200"              # set your ceiling
+          PLAYWRIGHT_ENGINE: "webkit"   # preferred; script will fall back automatically
+          DEBUG: "0"                    # set to "1" once if you want nextdata.json/screenshot
         run: python watcher.py
 
-      # Optional: artifacts to help debug a run (turn DEBUG=1 to generate nextdata.json/screenshot)
+      # Optional: upload debug artifacts if DEBUG=1
       - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4

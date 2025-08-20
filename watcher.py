@@ -1,13 +1,14 @@
-# Minimal Mercari -> Discord watcher (CI friendly, simple)
+# Minimal Mercari -> Discord watcher (CI-friendly, simple, engine-aware)
 # Requirements:
 #   pip install playwright requests python-dotenv
 #   python -m playwright install webkit
+#   (optional fallback) python -m playwright install chromium
 #
 # Env:
-#   DISCORD_WEBHOOK (required) - Discord channel webhook URL
-#   MAX_PRICE       (optional) - max price to include (default 9999)
+#   DISCORD_WEBHOOK   (required) - Discord channel webhook URL
+#   MAX_PRICE         (optional) - max price to include (default 9999)
 #   PLAYWRIGHT_ENGINE (optional) - webkit|chromium|firefox (default webkit)
-#   DEBUG           (optional) - "1"/"true" to save nextdata.json + screenshot
+#   DEBUG             (optional) - "1"/"true" to save nextdata.json + screenshot
 
 import asyncio, os, re, json
 from urllib.parse import urlencode
@@ -27,7 +28,6 @@ UA = (
     "Chrome/124.0 Safari/537.36"
 )
 
-# Keep the search simple and US-scoped
 SEARCH_PARAMS = {"keyword": "boygenius baggu", "sort": "created_time"}
 def build_search_url():
     return f"https://www.mercari.com/us/search/?{urlencode(SEARCH_PARAMS)}"
@@ -54,7 +54,6 @@ def walk_items(obj):
             pid = x.get("id") or x.get("itemId") or x.get("uuid")
             title = x.get("name") or x.get("title") or x.get("itemName")
             price = None
-            # common price shapes
             for k in ("price", "currentPrice", "amount", "itemPrice"):
                 if k in x:
                     price = parse_price_scalar(x[k]); break
@@ -68,19 +67,37 @@ def walk_items(obj):
         elif isinstance(x, list):
             for v in x: _walk(v)
     _walk(obj)
-    # de-dup
     uniq = {}
     for it in found:
         uniq[(it["id"], it["price"])] = it
     return list(uniq.values())
 
+async def launch_browser(pw, preferred="webkit"):
+    order = [preferred, "chromium", "firefox"]
+    seen = set()
+    last_err = None
+    for eng in [e for e in order if not (e in seen or seen.add(e))]:
+        try:
+            if eng == "chromium":
+                launcher = pw.chromium
+                args = ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled"]
+            elif eng == "webkit":
+                launcher = pw.webkit
+                args = []  # WebKit does not accept Chromium flags like --no-sandbox
+            else:
+                launcher = pw.firefox
+                args = []
+            browser = await launcher.launch(headless=True, args=args)
+            return browser, eng
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err if last_err else RuntimeError("Failed to launch any browser")
+
 async def fetch_listings():
     async with async_playwright() as pw:
-        launcher = {"webkit": pw.webkit, "chromium": pw.chromium, "firefox": pw.firefox}.get(ENGINE, pw.webkit)
-        browser = await launcher.launch(
-            headless=True,
-            args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-blink-features=AutomationControlled"],
-        )
+        browser, used_engine = await launch_browser(pw, preferred=ENGINE)
         ctx = await browser.new_context(
             user_agent=UA,
             locale="en-US",
@@ -97,61 +114,26 @@ async def fetch_listings():
         await page.wait_for_timeout(1200)  # small hydrate wait
 
         # Primary: parse Next.js data
+        listings = []
         text = await page.locator("script#__NEXT_DATA__").first.text_content()
-        items = []
         if text:
             try:
                 data = json.loads(text)
                 if DEBUG:
                     with open("nextdata.json","w",encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
-                items = walk_items(data)
-            except Exception:
-                items = []
-
-        # If nothing, quick fallback: anchors -> visit a few item pages' __NEXT_DATA__
-        listings = []
-        if not items:
-            anchors = await page.locator("a[href*='/item/']").all()
-            urls = []
-            for a in anchors:
-                href = await a.get_attribute("href")
-                if href and "/item/" in href:
-                    urls.append(href if href.startswith("http") else f"https://www.mercari.com{href}")
-            urls = list(dict.fromkeys(urls))[:6]
-            for item_url in urls:
-                p2 = await ctx.new_page()
-                try:
-                    await p2.goto(item_url, wait_until="domcontentloaded", timeout=90000)
-                    t2 = await p2.locator("script#__NEXT_DATA__").first.text_content()
-                    if not t2: continue
-                    d2 = json.loads(t2)
-                    for it in walk_items(d2):
-                        # accept the first good-looking item
-                        listings.append({
-                            "title": it["title"],
-                            "price": it["price"],
-                            "url": item_url
-                        })
-                        break
-                except Exception:
-                    pass
-                finally:
-                    await p2.close()
-        else:
-            # Build URLs when ID looks like Mercari item id
-            for it in items:
-                iid = str(it["id"])
-                if "/item/" in iid:
-                    url = f"https://www.mercari.com{iid}" if iid.startswith("/") else iid
-                else:
-                    url = f"https://www.mercari.com/us/item/{iid}/"
-                listings.append({"title": it["title"], "price": it["price"], "url": url})
-
-        if DEBUG:
-            try:
-                await page.screenshot(path="search.png", full_page=True)
+                for it in walk_items(data):
+                    iid = str(it["id"])
+                    if "/item/" in iid:
+                        iurl = f"https://www.mercari.com{iid}" if iid.startswith("/") else iid
+                    else:
+                        iurl = f"https://www.mercari.com/us/item/{iid}/"
+                    listings.append({"title": it["title"], "price": it["price"], "url": iurl})
             except Exception:
                 pass
+
+        if DEBUG:
+            try: await page.screenshot(path="search.png", full_page=True)
+            except Exception: pass
 
         await browser.close()
         return listings
