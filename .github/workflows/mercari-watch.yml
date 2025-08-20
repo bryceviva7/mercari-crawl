@@ -7,15 +7,45 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-      - run: pip install -r requirements.txt
-      - run: python -m playwright install chromium
-      - run: python watcher.py
+        with:
+          python-version: "3.11"
+
+      # System packages Playwright needs on Ubuntu runners
+      - name: Install system deps for Playwright
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 \
+            libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
+            libxkbcommon0 libasound2 libcups2 libcairo2 libpango-1.0-0 \
+            libpangocairo-1.0-0 libgtk-3-0
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright requests python-dotenv
+
+      - name: Install Playwright browser (WebKit)
+        run: python -m playwright install webkit
+
+      - name: Run watcher
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          ALERT_THRESHOLD: "200"
+          MAX_PRICE: "200"              # <- set your ceiling
+          PLAYWRIGHT_ENGINE: "webkit"   # <- default is webkit; keep it simple
+          DEBUG: "0"                    # set to "1" for one run if you need to debug
+        run: python watcher.py
+
+      # Optional: artifacts to help debug one time
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mercari-debug
+          path: |
+            nextdata.json
+            search.png
