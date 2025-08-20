@@ -1,4 +1,4 @@
-# watcher.py (simple)
+# watcher.py (simple with MAX_PRICE)
 # ------------------------------
 # Requirements:
 #   pip install playwright requests python-dotenv
@@ -6,6 +6,7 @@
 #
 # Env vars (.env or GitHub Actions secrets):
 #   DISCORD_WEBHOOK   (required) - Discord channel webhook URL
+#   MAX_PRICE         (optional) - maximum price to include (default 9999)
 
 import asyncio, os, re
 from urllib.parse import urlencode
@@ -16,6 +17,7 @@ from playwright.async_api import async_playwright
 
 load_dotenv()
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
+MAX_PRICE = int(os.getenv("MAX_PRICE", "9999"))  # default high, override as needed
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -70,13 +72,15 @@ async def fetch_listings():
 
 async def main():
     listings = await fetch_listings()
+    listings = [item for item in listings if item["price"] <= MAX_PRICE]
+
     if not listings:
-        msg = "✅ Scan complete: nothing found."
+        msg = f"✅ Scan complete: nothing found under ${MAX_PRICE}."
         print(msg)
         send_discord_message(msg)
     else:
-        msg_lines = ["✅ Scan complete: here are the listings:"]
-        for item in listings[:10]:  # show first 10 to avoid huge spam
+        msg_lines = [f"✅ Scan complete: here are the listings under ${MAX_PRICE}:"]
+        for item in listings[:10]:  # show first 10
             msg_lines.append(f"- {item['title']} — ${item['price']} — {item['url']}")
         msg = "\n".join(msg_lines)
         print(msg)
